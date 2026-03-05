@@ -35,7 +35,18 @@ if __name__ == "__main__":
                       help='Minimum token threshold for thinning (markdown only)')
     parser.add_argument('--summary-token-threshold', type=int, default=200,
                       help='Token threshold for generating summaries (markdown only)')
+    
+    parser.add_argument("--output_dir", type=str, default="./results", help="Directory to save structured JSON")
     args = parser.parse_args()
+
+    if os.path.isabs(args.output_dir):
+        output_dir = args.output_dir
+    else:
+        output_dir = os.path.abspath(os.path.join(os.getcwd(), args.output_dir))
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"[PageIndex] Saving JSON to: {output_dir}")
     
     # Validate that exactly one file type is specified
     if not args.pdf_path and not args.md_path:
@@ -68,10 +79,18 @@ if __name__ == "__main__":
         print('Parsing done, saving to file...')
         
         # Save results
-        pdf_name = os.path.splitext(os.path.basename(args.pdf_path))[0]    
-        output_dir = './results'
-        output_file = f'{output_dir}/{pdf_name}_structure.json'
+
+        # -----------------------------------------
+        # Resolve output directory
+        # -----------------------------------------
+        output_dir = os.path.abspath(args.output_dir)
         os.makedirs(output_dir, exist_ok=True)
+
+        # -----------------------------------------
+        # Build output filename
+        # -----------------------------------------
+        pdf_name = os.path.splitext(os.path.basename(args.pdf_path))[0]
+        output_file = os.path.join(output_dir, f"{pdf_name}_structure.json")
         
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(toc_with_page_number, f, indent=2)
