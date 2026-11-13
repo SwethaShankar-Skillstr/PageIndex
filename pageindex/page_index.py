@@ -115,11 +115,23 @@ def toc_detector_single_page(content, model=None):
 
     Directly return the final JSON structure. Do not output anything else.
     Please note: abstract,summary, notation list, figure list, table list, etc. are not table of contents."""
+    try:
+        response = ChatGPT_API(model=model, prompt=prompt)
+        json_content = extract_json(response)
 
-    response = ChatGPT_API(model=model, prompt=prompt)
-    # print('response', response)
-    json_content = extract_json(response)    
-    return json_content['toc_detected']
+        if not isinstance(json_content, dict):
+            return "no"
+
+        toc_detected = str(json_content.get("toc_detected", "no")).strip().lower()
+
+        if toc_detected not in {"yes", "no"}:
+            return "no"
+
+        return toc_detected
+
+    except Exception as e:
+        print(f"[toc_detector_single_page] failed: {e}")
+        return "no"
 
 
 def check_if_toc_extraction_is_complete(content, toc, model=None):
@@ -269,66 +281,95 @@ def toc_index_extractor(toc, content, model=None):
 
 def toc_transformer(toc_content, model=None):
     print('start toc_transformer')
+
+    def clean_json_text(text: str) -> str:
+        text = text.strip()
+
+        if text.startswith("```json"):
+            text = text[len("```json"):].strip()
+        elif text.startswith("```"):
+            text = text[len("```"):].strip()
+
+        if text.endswith("```"):
+            text = text[:-3].strip()
+
+        return text
+
+    def parse_first_json(text: str):
+        text = clean_json_text(text)
+        decoder = json.JSONDecoder()
+        obj, _ = decoder.raw_decode(text)
+        return obj
+
     init_prompt = """
-    You are given a table of contents, You job is to transform the whole table of content into a JSON format included table_of_contents.
+    You are given a table of contents. Your job is to transform the whole table of contents into a JSON format with key "table_of_contents".
 
     structure is the numeric system which represents the index of the hierarchy section in the table of contents. For example, the first section has structure index 1, the first subsection has structure index 1.1, the second subsection has structure index 1.2, etc.
 
-    The response should be in the following JSON format: 
+    The response should be in the following JSON format:
     {
-    table_of_contents: [
+      "table_of_contents": [
         {
-            "structure": <structure index, "x.x.x" or None> (string),
-            "title": <title of the section>,
-            "page": <page number or None>,
-        },
-        ...
-        ],
+          "structure": <structure index, "x.x.x" or None>,
+          "title": <title of the section>,
+          "page": <page number or None>
+        }
+      ]
     }
-    You should transform the full table of contents in one go.
-    Directly return the final JSON structure, do not output anything else. """
 
-    prompt = init_prompt + '\n Given table of contents\n:' + toc_content
+    Return only valid JSON.
+    Do not include markdown fences.
+    Do not include explanation text.
+    """
+
+    prompt = init_prompt + '\nGiven table of contents:\n' + toc_content
     last_complete, finish_reason = ChatGPT_API_with_finish_reason(model=model, prompt=prompt)
+
     if_complete = check_if_toc_transformation_is_complete(toc_content, last_complete, model)
+
     if if_complete == "yes" and finish_reason == "finished":
-        last_complete = extract_json(last_complete)
-        cleaned_response=convert_page_to_int(last_complete['table_of_contents'])
+        parsed = parse_first_json(last_complete)
+        cleaned_response = convert_page_to_int(parsed["table_of_contents"])
         return cleaned_response
-    
-    last_complete = get_json_content(last_complete)
+
+    # keep only JSON-ish content
+    last_complete = clean_json_text(last_complete)
+
+    max_attempts = 5
+    attempts = 0
+
     while not (if_complete == "yes" and finish_reason == "finished"):
-        position = last_complete.rfind('}')
-        if position != -1:
-            last_complete = last_complete[:position+2]
+        attempts += 1
+        if attempts > max_attempts:
+            raise Exception(f"Failed to complete TOC transformation after {max_attempts} attempts. Raw output:\n{last_complete}")
+
         prompt = f"""
-        Your task is to continue the table of contents json structure, directly output the remaining part of the json structure.
-        The response should be in the following JSON format: 
+Your task is to continue the incomplete JSON only.
 
-        The raw table of contents json structure is:
-        {toc_content}
+Raw table of contents:
+{toc_content}
 
-        The incomplete transformed table of contents json structure is:
-        {last_complete}
+Incomplete JSON:
+{last_complete}
 
-        Please continue the json structure, directly output the remaining part of the json structure."""
+Return only the missing continuation text.
+Do not restart from the beginning.
+Do not add markdown fences.
+Do not add explanations.
+"""
 
         new_complete, finish_reason = ChatGPT_API_with_finish_reason(model=model, prompt=prompt)
+        new_complete = clean_json_text(new_complete)
 
-        if new_complete.startswith('```json'):
-            new_complete =  get_json_content(new_complete)
-            last_complete = last_complete+new_complete
+        # always append, not only when fenced
+        last_complete = last_complete + new_complete
 
         if_complete = check_if_toc_transformation_is_complete(toc_content, last_complete, model)
-        
 
-    last_complete = json.loads(last_complete)
-
-    cleaned_response=convert_page_to_int(last_complete['table_of_contents'])
+    parsed = parse_first_json(last_complete)
+    cleaned_response = convert_page_to_int(parsed["table_of_contents"])
     return cleaned_response
     
-
-
 
 def find_toc_pages(start_page_index, page_list, opt, logger=None):
     print('start find_toc_pages')
@@ -406,11 +447,23 @@ def calculate_page_offset(pairs):
     return most_common
 
 def add_page_offset_to_toc_json(data, offset):
+    if offset is None:
+        print("[PageIndex] WARNING: TOC page offset could not be inferred. Defaulting offset to 0.")
+        offset = 0
+
     for i in range(len(data)):
-        if data[i].get('page') is not None and isinstance(data[i]['page'], int):
-            data[i]['physical_index'] = data[i]['page'] + offset
-            del data[i]['page']
-    
+        page = data[i].get("page")
+
+        if page is None:
+            print(f"[PageIndex] WARNING: TOC item has no page number: {data[i]}")
+            data[i]["physical_index"] = None
+        else:
+            data[i]["physical_index"] = int(page) + offset
+
+        children = data[i].get("children") or data[i].get("nodes") or []
+        if children:
+            add_page_offset_to_toc_json(children, offset)
+
     return data
 
 
